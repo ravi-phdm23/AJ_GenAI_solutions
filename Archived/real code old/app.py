@@ -1,6 +1,6 @@
 import streamlit as st
 import pandas as pd
-from bcbs_189_vector_rag_02_mocked import generate_test_cases_for_requirement, init_rag_chain
+from bcbs_189_vector_rag_02 import generate_test_cases_for_requirement, init_rag_chain
 
 st.set_page_config(page_title="Basel 3.1 Test Case Generator", layout="wide")
 # Custom CSS to handle long text in DataFrame

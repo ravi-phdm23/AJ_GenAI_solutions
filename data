@@ -1,10 +1,338 @@
-app_mocked.py
+Real Code
 
-  import streamlit as st
+app_llm_final.py
+
+
+import streamlit as st
 import pandas as pd
-from bcbs_189_vector_rag_02_mocked import generate_test_cases_for_requirement, init_rag_chain
+from bcbs_189_vector_rag_02_updated import generate_test_cases_for_requirement, init_rag_chain
 
 st.set_page_config(page_title="Basel 3.1 Test Case Generator", layout="wide")
+
+st.markdown("""
+    <style>
+    .dataframe td {
+        white-space: pre-wrap;
+        word-wrap: break-word;
+        vertical-align: top;
+    }
+    .stDataFrame div[data-testid="stVerticalBlock"] {
+        overflow-x: auto;
+    }
+    </style>
+""", unsafe_allow_html=True)
+
+st.title("🧪 Basel 3.1 RAG-based Test Case Generator")
+st.markdown("This app uses LLM + Vector Search to generate structured test cases from Basel 3.1 regulatory requirements.")
+
+# --- Test Mode Toggle ---
+test_mode = st.checkbox("🧪 Enable Test Mode (truncated PDF + GPT-3.5)", value=True)
+model_name = None  # Will initialize later after file upload
+
+
+# --- Step 1: Test Case Requirement Input ---
+st.header("📌 Step 1: Enter or Upload Basel Requirements")
+
+input_mode = st.radio("Select Input Method for Requirements:", ["Manual Entry", "Upload CSV File"], horizontal=True)
+
+manual_reqs, csv_reqs = [], []
+
+if input_mode == "Manual Entry":
+    multiline_input = st.text_area(
+        "✍️ Enter one or more Basel 3.1 requirements (each on a new line):",
+        height=200,
+        placeholder="e.g.\n1. Real estate exposures must be risk-weighted based on LTV.\n2. Output floor must be applied at 72.5%..."
+    )
+    if multiline_input.strip():
+        manual_reqs = [line.strip() for line in multiline_input.strip().splitlines() if line.strip()]
+
+elif input_mode == "Upload CSV File":
+    uploaded_file = st.file_uploader("📄 Upload CSV file with a 'requirement' column:", type=['csv'])
+    if uploaded_file:
+        df_uploaded = pd.read_csv(uploaded_file)
+        if 'requirement' in df_uploaded.columns:
+            csv_reqs = df_uploaded['requirement'].dropna().tolist()
+            st.success(f"✅ {len(csv_reqs)} requirements loaded from CSV.")
+        else:
+            st.error("❌ Uploaded file must contain a column named 'requirement'.")
+
+all_reqs = manual_reqs or csv_reqs
+
+# --- Step 2: Supporting File Upload ---
+st.header("📂 Step 2: (Optional) Upload Supporting Files")
+
+folder_reqs = []
+uploaded_files = st.file_uploader(
+    "📁 Upload files for context extraction (txt, pdf, docx, xlsx):",
+    type=["csv", "xls", "xlsx", "txt", "docx", "pdf"],
+    accept_multiple_files=True
+)
+
+if uploaded_files:
+    st.success(f"✅ {len(uploaded_files)} files uploaded.")
+    model_name = init_rag_chain(test_mode, uploaded_files)  # ✅ Now safe
+
+    for file in uploaded_files:
+        st.markdown(f"- {file.name}")
+        try:
+            if file.name.endswith(".csv"):
+                df = pd.read_csv(file)
+                if 'requirement' in df.columns:
+                    folder_reqs.extend(df['requirement'].dropna().tolist())
+            elif file.name.endswith((".xls", ".xlsx")):
+                df = pd.read_excel(file)
+                if 'requirement' in df.columns:
+                    folder_reqs.extend(df['requirement'].dropna().tolist())
+            elif file.name.endswith(".txt"):
+                content = file.read().decode("utf-8")
+                folder_reqs.extend([line.strip() for line in content.splitlines() if line.strip()])
+            elif file.name.endswith(".docx"):
+                from docx import Document
+                doc = Document(file)
+                folder_reqs.extend([para.text.strip() for para in doc.paragraphs if para.text.strip()])
+            elif file.name.endswith(".pdf"):
+                from PyPDF2 import PdfReader
+                reader = PdfReader(file)
+                for page in reader.pages:
+                    text = page.extract_text()
+                    if text:
+                        folder_reqs.extend([line.strip() for line in text.splitlines() if line.strip()])
+        except Exception as e:
+            st.warning(f"❌ Failed to process {file.name}: {e}")
+else:
+    st.info("You can skip this step if you have no supporting files.")
+
+# --- Step 3: Generate Test Cases ---
+final_reqs = all_reqs or folder_reqs
+if final_reqs:
+    st.header("🧪 Step 3: Generate Test Cases")
+
+    if st.button("🚀 Generate Test Cases"):
+        all_results, total_tokens = [], 0
+        with st.spinner("Processing each requirement..."):
+            for i, req in enumerate(final_reqs, 1):
+                st.markdown(f"---\n### 🔍 Requirement {i} of {len(final_reqs)}:")
+                st.code(req, language='text')
+
+                result_df, rag_tok, struct_tok = generate_test_cases_for_requirement(req)
+                if isinstance(result_df, pd.DataFrame):
+                    st.dataframe(result_df, use_container_width=True)
+                    all_results.append(result_df)
+                    total_tokens += (rag_tok + struct_tok)
+                    st.caption(f"🔢 Tokens used for this requirement: RAG = {rag_tok}, Prompt = {struct_tok}, Total = {rag_tok + struct_tok}")
+                else:
+                    st.error(result_df)
+
+        if all_results:
+            final_df = pd.concat(all_results, ignore_index=True)
+            csv = final_df.to_csv(index=False).encode('utf-8')
+            st.download_button("📥 Download All Test Cases (CSV)", csv, "basel_test_cases.csv", "text/csv")
+            st.success(f"📊 Total Tokens Used: {total_tokens}")
+else:
+    st.info("Please input Basel requirements to proceed.")
+
+
+
+
+
+bcbs_189_vector_rag_02_updated.py
+
+
+
+
+
+import os
+from dotenv import load_dotenv
+from typing import List, Union
+from pydantic import BaseModel
+import pandas as pd
+import re
+import tiktoken
+
+from langchain_community.document_loaders import PyPDFLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain_core.prompts import PromptTemplate
+from langchain_core.runnables import RunnableParallel, RunnablePassthrough, RunnableLambda
+from langchain_core.output_parsers import StrOutputParser
+
+from io import BytesIO
+from PyPDF2 import PdfReader
+from docx import Document
+
+# --- Load environment ---
+load_dotenv()
+
+# --- Globals ---
+rag_chain = None
+llm_for_structured = None
+model_name = "gpt-3.5-turbo"
+
+# --- Format for RAG ---
+def format_docs(docs):
+    return "\n\n".join(doc.page_content for doc in docs)
+
+rag_prompt = PromptTemplate(
+    template="""
+You are a Basel III regulatory assistant.
+Answer ONLY using the context below.
+If context is insufficient, say "Insufficient context."
+
+{context}
+Question: {question}
+""",
+    input_variables=["context", "question"]
+)
+
+# --- Schema Definitions ---
+class BaselTestCase(BaseModel):
+    test_title: str
+    test_case_title: str
+    test_case_description: str
+    test_steps: List[str]
+    test_data: List[str]
+    expected_results: List[str]
+
+class BaselTestCaseList(BaseModel):
+    test_cases: List[BaselTestCase]
+
+# --- Token Estimation ---
+def estimate_tokens(text: str, model_name: str) -> int:
+    try:
+        enc = tiktoken.encoding_for_model(model_name)
+    except KeyError:
+        enc = tiktoken.get_encoding("cl100k_base")
+    return len(enc.encode(text))
+
+# --- Build Prompt ---
+def build_testcase_prompt(rag_answer: str, max_cases: int = 2) -> str:
+    return (
+        "You are a Basel 3.1 compliance testing expert.\n"
+        f"Based on the following document-derived context, generate {max_cases} test cases:\n\n"
+        f"{rag_answer}\n\n"
+        "Each test case must include:\n"
+        "- Test title\n"
+        "- Test case title and description\n"
+        "- At least 3 test steps\n"
+        "- Test data\n"
+        "- Expected results\n\n"
+        "Return only JSON under key 'test_cases'."
+    )
+
+
+# --- Load Files from Upload and Build Vector Store ---
+def load_documents_from_uploads(uploaded_files: List[BytesIO], test_mode: bool = False):
+    from langchain_core.documents import Document as LC_Document
+    all_texts = []
+
+    for file in uploaded_files:
+        filename = file.name.lower()
+        try:
+            if filename.endswith(".pdf"):
+                reader = PdfReader(file)
+                for page in reader.pages:
+                    text = page.extract_text()
+                    if text:
+                        all_texts.append(LC_Document(page_content=text.strip()))
+            elif filename.endswith(".docx"):
+                doc = Document(file)
+                for para in doc.paragraphs:
+                    if para.text.strip():
+                        all_texts.append(LC_Document(page_content=para.text.strip()))
+            elif filename.endswith(".txt"):
+                content = file.read().decode("utf-8")
+                for line in content.splitlines():
+                    if line.strip():
+                        all_texts.append(LC_Document(page_content=line.strip()))
+        except Exception as e:
+            print(f"⚠️ Failed to read {filename}: {e}")
+
+    if test_mode:
+        all_texts = all_texts[:2]
+        for doc in all_texts:
+            doc.page_content = doc.page_content[:1000]
+
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+    chunks = splitter.split_documents(all_texts)
+    embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+    vector_store = FAISS.from_documents(chunks, embeddings)
+    return vector_store.as_retriever(search_type="similarity", search_kwargs={"k": 4})
+
+# --- Init with Uploaded Files ---
+def init_rag_chain(test_mode=False, uploaded_files: Union[List[BytesIO], None] = None):
+    global rag_chain, llm_for_structured, model_name
+
+    model_name = "gpt-3.5-turbo" if test_mode else "gpt-4"
+
+    if uploaded_files:
+        retriever = load_documents_from_uploads(uploaded_files, test_mode)
+    else:
+        raise ValueError("Uploaded files are required for initializing RAG.")
+
+    rag_chain = (
+        RunnableParallel({
+            "context": retriever | RunnableLambda(format_docs),
+            "question": RunnablePassthrough()
+        })
+        | rag_prompt
+        | ChatOpenAI(model=model_name, temperature=0.2, max_tokens=512)
+        | StrOutputParser()
+    )
+
+    llm_for_structured = ChatOpenAI(
+        model=model_name,
+        temperature=0,
+        max_tokens=1024
+    ).with_structured_output(BaselTestCaseList, method="function_calling")
+
+    return model_name
+
+# --- Main Test Case Function ---
+def generate_test_cases_for_requirement(requirement: str):
+    try:
+        rag_answer = rag_chain.invoke(requirement)
+        test_prompt = build_testcase_prompt(rag_answer)
+        structured_result = llm_for_structured.invoke(test_prompt)
+
+        rag_tokens = estimate_tokens(rag_answer, model_name)
+        prompt_tokens = estimate_tokens(test_prompt, model_name)
+
+        result_rows = []
+        for tc in structured_result.test_cases:
+            d = tc.dict()
+            max_len = max(len(d['test_steps']), len(d['test_data']), len(d['expected_results']))
+            for i in range(max_len):
+                result_rows.append({
+                    'requirement': requirement,
+                    'test_title': d['test_title'],
+                    'test_case_title': d['test_case_title'],
+                    'test_case_description': d['test_case_description'],
+                    'step_number': f"Step {i+1}",
+                    'test_step': re.sub(r"^Step\s*\d+\s*:\s*", "", d['test_steps'][i]) if i < len(d['test_steps']) else "",
+                    'test_data': d['test_data'][i] if i < len(d['test_data']) else "",
+                    'expected_result': d['expected_results'][i] if i < len(d['expected_results']) else ""
+                })
+
+        return pd.DataFrame(result_rows), rag_tokens, prompt_tokens
+    except Exception as e:
+        return f"Error: {e}", 0, 0
+
+
+
+#################################################################################################
+Mock
+
+
+app_01_final.py
+
+
+import streamlit as st
+import pandas as pd
+from bcbs_189_vector_rag_mocked import generate_test_cases_for_requirement, init_rag_chain
+
+st.set_page_config(page_title="Basel 3.1 Test Case Generator", layout="wide")
+
 # Custom CSS to handle long text in DataFrame
 st.markdown("""
     <style>
@@ -21,16 +349,19 @@ st.markdown("""
 
 st.title("🧪 Basel 3.1 RAG-based Test Case Generator")
 
-st.markdown("This app uses LLM + Vector Search to generate structured test cases from Basel 3.1 regulatory requirements.")
+st.markdown("This app uses dummy logic to simulate structured test case generation from Basel 3.1 regulatory requirements.")
 
 # --- Test Mode Toggle ---
-test_mode = st.checkbox("🧪 Enable Test Mode (truncated PDF + GPT-3.5)", value=True)
+test_mode = st.checkbox("🧪 Enable Test Mode (simulated)", value=True)
 model_name = init_rag_chain(test_mode)
 
-# --- Input Method ---
-input_mode = st.radio("📥 Select Input Method:", ["Manual Entry", "Upload CSV File"], horizontal=True)
+# --- Step 1: Test Case Input ---
+st.header("📌 Step 1: Enter or Upload Basel Requirements")
+
+input_mode = st.radio("Select Input Method for Requirements:", ["Manual Entry", "Upload CSV File"], horizontal=True)
 
 manual_reqs, csv_reqs = [], []
+
 if input_mode == "Manual Entry":
     multiline_input = st.text_area(
         "✍️ Enter one or more Basel 3.1 requirements (each on a new line):",
@@ -39,7 +370,8 @@ if input_mode == "Manual Entry":
     )
     if multiline_input.strip():
         manual_reqs = [line.strip() for line in multiline_input.strip().splitlines() if line.strip()]
-else:
+
+elif input_mode == "Upload CSV File":
     uploaded_file = st.file_uploader("📄 Upload CSV file with a 'requirement' column:", type=['csv'])
     if uploaded_file:
         df_uploaded = pd.read_csv(uploaded_file)
@@ -49,14 +381,60 @@ else:
         else:
             st.error("❌ Uploaded file must contain a column named 'requirement'.")
 
-# --- Run and Show Results ---
 all_reqs = manual_reqs or csv_reqs
-if all_reqs:
+
+# --- Step 2: Supporting Files Upload ---
+st.header("📂 Step 2: (Optional) Upload Supporting Files (PDF, TXT, DOCX, Excel)")
+
+folder_reqs = []
+uploaded_files = st.file_uploader(
+    "📁 Upload files:",
+    type=["csv", "xls", "xlsx", "txt", "docx", "pdf"],
+    accept_multiple_files=True
+)
+
+if uploaded_files:
+    st.success(f"✅ {len(uploaded_files)} files uploaded.")
+    for file in uploaded_files:
+        st.markdown(f"- {file.name}")
+        try:
+            if file.name.endswith(".csv"):
+                df = pd.read_csv(file)
+                if 'requirement' in df.columns:
+                    folder_reqs.extend(df['requirement'].dropna().tolist())
+            elif file.name.endswith((".xls", ".xlsx")):
+                df = pd.read_excel(file)
+                if 'requirement' in df.columns:
+                    folder_reqs.extend(df['requirement'].dropna().tolist())
+            elif file.name.endswith(".txt"):
+                content = file.read().decode("utf-8")
+                folder_reqs.extend([line.strip() for line in content.splitlines() if line.strip()])
+            elif file.name.endswith(".docx"):
+                from docx import Document
+                doc = Document(file)
+                folder_reqs.extend([para.text.strip() for para in doc.paragraphs if para.text.strip()])
+            elif file.name.endswith(".pdf"):
+                from PyPDF2 import PdfReader
+                reader = PdfReader(file)
+                for page in reader.pages:
+                    text = page.extract_text()
+                    if text:
+                        folder_reqs.extend([line.strip() for line in text.splitlines() if line.strip()])
+        except Exception as e:
+            st.warning(f"❌ Failed to process {file.name}: {e}")
+else:
+    st.info("You can skip this step if you have no supporting files.")
+
+# --- Step 3: Generate Test Cases ---
+final_reqs = all_reqs or folder_reqs
+if final_reqs:
+    st.header("🧪 Step 3: Generate Test Cases")
+
     if st.button("🚀 Generate Test Cases"):
         all_results, total_tokens = [], 0
         with st.spinner("Processing each requirement..."):
-            for i, req in enumerate(all_reqs, 1):
-                st.markdown(f"---\n### 🔍 Requirement {i} of {len(all_reqs)}:")
+            for i, req in enumerate(final_reqs, 1):
+                st.markdown(f"---\n### 🔍 Requirement {i} of {len(final_reqs)}:")
                 st.code(req, language='text')
 
                 result_df, rag_tok, struct_tok = generate_test_cases_for_requirement(req)
@@ -64,21 +442,22 @@ if all_reqs:
                     st.dataframe(result_df, use_container_width=True)
                     all_results.append(result_df)
                     total_tokens += (rag_tok + struct_tok)
-                    st.caption(f"🔢 Tokens used for this requirement: RAG = {rag_tok}, Prompt = {struct_tok}, Total = {rag_tok + struct_tok}")
+                    st.caption(f"🔢 Tokens used for this requirement: Simulated = {rag_tok + struct_tok}")
                 else:
                     st.error(result_df)
 
-        # --- Export
         if all_results:
             final_df = pd.concat(all_results, ignore_index=True)
             csv = final_df.to_csv(index=False).encode('utf-8')
             st.download_button("📥 Download All Test Cases (CSV)", csv, "basel_test_cases.csv", "text/csv")
-            st.success(f"📊 Total Tokens Used: {total_tokens}")
+            st.success(f"📊 Total Simulated Tokens Used: {total_tokens}")
 else:
-    st.info("Please enter requirements or upload a file.")
+    st.info("Please input Basel requirements to proceed.")
 
 
-BCBS.py
+###############################
+
+bcbs_189_vector_rag_mocked.py
 
 
 import pandas as pd
@@ -157,8 +536,5 @@ def generate_test_cases_for_requirement(requirement: str):
 def init_rag_chain(test_mode=False):
     return "dummy-model"
 
-requirement
-Total RWAs (post-floor) â‰¥ 72.5% of RWAs calculated under standardized approaches
-Risk weights for real estate exposures must be assigned based on LTV thresholds: <=80% = 35%, >80% = 75%.
-Retail SME exposures must be < EUR 1 million and part of a diversified portfolio to qualify for 75% RW.
+
 

@@ -1,4 +1,15 @@
-requirement
-"Total RWAs (post-floor) ≥ 72.5% of RWAs calculated under standardized approaches"
-"Risk weights for real estate exposures must be assigned based on LTV thresholds: <=80% = 35%, >80% = 75%."
-Retail SME exposures must be < EUR 1 million and part of a diversified portfolio to qualify for 75% RW.
+requirement,,
+Total RWAs (post-floor) ≥ 72.5% of RWAs calculated under standardized approaches,,
+"Risk weights for real estate exposures must be assigned based on LTV thresholds: <=80% = 35%, >80% = 75%.",,
+Retail SME exposures must be < EUR 1 million and part of a diversified portfolio to qualify for 75% RW.,,
+,,
+,,
+,,
+,,
+,,
+,,
+,,
+,,
+,,
+,,
+,,"set GOOGLE_APPLICATION_CREDENTIALS=""C:\Users\Arnav\Documents\Python\TCoE\Test case uploader\cohesive-apogee-411113-f92cebad57a4.json"""
